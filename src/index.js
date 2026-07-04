@@ -190,61 +190,6 @@ function summarizeRecord(record) {
   }
 }
 
-function buildInitialContent(title) {
-  const safeTitle = String(title || '协作文档').trim() || '协作文档'
-  return {
-    type: 'doc',
-    content: [
-      {
-        type: 'heading',
-        attrs: { level: 1 },
-        content: [{ type: 'text', text: safeTitle }],
-      },
-      {
-        type: 'paragraph',
-        content: [
-          {
-            type: 'text',
-            text: '这是协作文档的初始内容。现在开始一起编辑吧。',
-          },
-        ],
-      },
-      {
-        type: 'bulletList',
-        content: [
-          {
-            type: 'listItem',
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text: '补充项目背景' }],
-              },
-            ],
-          },
-          {
-            type: 'listItem',
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text: '整理待办任务' }],
-              },
-            ],
-          },
-          {
-            type: 'listItem',
-            content: [
-              {
-                type: 'paragraph',
-                content: [{ type: 'text', text: '同步成员分工' }],
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  }
-}
-
 /**
  * plain_text 不是简单地 JSON.stringify(content_json)。
  * 这里递归抽取文本，并在块级节点之间补换行，
@@ -366,16 +311,8 @@ async function loadPersistedDocument(documentName, document) {
     }
   }
 
-  const initialTitle = savedRecord?.title || '协作文档'
-  const initialYDoc = TiptapTransformer.extensions(snapshotExtensions).toYdoc(
-    buildInitialContent(initialTitle),
-    TIPTAP_FIELD_NAME,
-    snapshotExtensions,
-  )
-  Y.applyUpdate(document, Y.encodeStateAsUpdate(initialYDoc))
-  logStep('ydoc.initialContent.applied', {
+  logStep('ydoc.emptyDocument.ready', {
     docId,
-    title: initialTitle,
     elapsed: elapsedMs(startedAt),
   })
 }
