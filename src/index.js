@@ -21,6 +21,10 @@ const PORT = Number(process.env.PORT || 1234)
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017'
 const MONGODB_DB = process.env.MONGODB_DB || 'teamup'
 const MONGODB_COLLECTION = process.env.MONGODB_COLLECTION || 'collaboration_documents'
+const SUMMARY_CALLBACK_URL = process.env.SUMMARY_CALLBACK_URL
+  || 'http://127.0.0.1:8080/internal/collaboration-summary/content-changed'
+const SUMMARY_CALLBACK_TOKEN = process.env.COLLABORATION_SUMMARY_INTERNAL_TOKEN
+  || 'teamup-local-collaboration-summary-token'
 const TIPTAP_FIELD_NAME = 'default'
 const LOG_PREFIX = '[collab-server]'
 
@@ -367,6 +371,40 @@ async function storePersistedDocument(documentName, document) {
     modifiedCount: result.modifiedCount,
     upsertedId: result.upsertedId,
   })
+  void notifySummaryDebounce(docId)
+}
+
+/**
+ * 协同服务只负责在 MongoDB 成功落盘后通知业务后端；通知失败不能影响
+ * 编辑内容持久化。后端用 Redis ZSet 覆盖同一 docId 的到期时间，实现 10 分钟防抖。
+ */
+async function notifySummaryDebounce(docId) {
+  if (!SUMMARY_CALLBACK_URL || !docId) {
+    return
+  }
+  try {
+    const response = await fetch(SUMMARY_CALLBACK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Collaboration-Internal-Token': SUMMARY_CALLBACK_TOKEN,
+      },
+      body: JSON.stringify({ documentId: docId }),
+    })
+    if (!response.ok) {
+      warnStep('summary.debounce.notify.failed', {
+        docId,
+        status: response.status,
+      })
+      return
+    }
+    logStep('summary.debounce.notify.success', { docId })
+  } catch (error) {
+    warnStep('summary.debounce.notify.error', {
+      docId,
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 const server = new Server({
