@@ -71,6 +71,10 @@ MONGODB_COLLECTION=collaboration_documents
 # 协同内容落盘后的后端内部回调
 SUMMARY_CALLBACK_URL=http://127.0.0.1:8080/internal/collaboration-summary/content-changed
 COLLABORATION_SUMMARY_INTERNAL_TOKEN=replace-with-the-same-token-as-backend
+
+# 文档助手草案快照与确认执行的内部 HTTP 接口（只允许 TeamUp 后端访问）
+AGENT_INTERNAL_API_PORT=1235
+COLLABORATION_AGENT_INTERNAL_TOKEN=replace-with-the-same-token-as-backend
 ```
 
 `COLLABORATION_SUMMARY_INTERNAL_TOKEN` 必须与后端的同名环境变量一致。生产环境不要使用代码中的本地默认令牌，并应将回调地址限制在可信内网。

@@ -1,4 +1,6 @@
 import dotenv from 'dotenv'
+import { createServer as createHttpServer } from 'node:http'
+import { createHash } from 'node:crypto'
 import { Server } from '@hocuspocus/server'
 import { TiptapTransformer } from '@hocuspocus/transformer'
 import StarterKit from '@tiptap/starter-kit'
@@ -14,6 +16,14 @@ import Underline from '@tiptap/extension-underline'
 import { Extension } from '@tiptap/core'
 import { MongoClient } from 'mongodb'
 import * as Y from 'yjs'
+import {
+  AgentPatchConflictError,
+  applyAgentPatchToYDoc,
+  buildAgentBlocks,
+  patchSummary,
+  publicPatchChanges,
+  simulateAgentPatch,
+} from './agent-document-patch.js'
 
 dotenv.config()
 
@@ -25,6 +35,9 @@ const SUMMARY_CALLBACK_URL = process.env.SUMMARY_CALLBACK_URL
   || 'http://127.0.0.1:8080/internal/collaboration-summary/content-changed'
 const SUMMARY_CALLBACK_TOKEN = process.env.COLLABORATION_SUMMARY_INTERNAL_TOKEN
   || 'teamup-local-collaboration-summary-token'
+const AGENT_INTERNAL_API_PORT = Number(process.env.AGENT_INTERNAL_API_PORT || 1235)
+const AGENT_INTERNAL_API_TOKEN = process.env.COLLABORATION_AGENT_INTERNAL_TOKEN
+  || 'teamup-local-collaboration-agent-token'
 const TIPTAP_FIELD_NAME = 'default'
 const LOG_PREFIX = '[collab-server]'
 
@@ -342,6 +355,8 @@ async function storePersistedDocument(documentName, document) {
     updateBytes: binaryState.byteLength,
   })
   const { contentJson, plainText } = ydocToSnapshots(document)
+  const previousRecord = await collection.findOne({ docId })
+  const textChanged = previousRecord == null || previousRecord.plain_text !== plainText
 
   logStep('mongo.updateOne.start', {
     docId,
@@ -371,8 +386,117 @@ async function storePersistedDocument(documentName, document) {
     modifiedCount: result.modifiedCount,
     upsertedId: result.upsertedId,
   })
-  void notifySummaryDebounce(docId)
+  if (textChanged) {
+    void notifySummaryDebounce(docId)
+  }
 }
+
+function contentHash(contentJson) {
+  return createHash('sha256').update(buildPlainText(contentJson), 'utf8').digest('hex')
+}
+
+async function withAgentDocument(documentId, callback) {
+  const connection = await server.hocuspocus.openDirectConnection(documentId, { source: 'agent-document-api' })
+  try {
+    if (!connection.document) {
+      throw new Error('协作文档未加载')
+    }
+    return await callback(connection.document, connection)
+  } finally {
+    await connection.disconnect()
+  }
+}
+
+function writeJson(response, statusCode, payload) {
+  response.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' })
+  response.end(JSON.stringify(payload))
+}
+
+async function readJson(request) {
+  const chunks = []
+  for await (const chunk of request) {
+    chunks.push(chunk)
+  }
+  const raw = Buffer.concat(chunks).toString('utf8')
+  return raw ? JSON.parse(raw) : {}
+}
+
+async function handleAgentDocumentRequest(request, response) {
+  const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`)
+  if (request.method !== 'POST' || !url.pathname.startsWith('/internal/agent-document/')) {
+    writeJson(response, 404, { message: 'Not found' })
+    return
+  }
+  if (request.headers['x-collaboration-agent-token'] !== AGENT_INTERNAL_API_TOKEN) {
+    writeJson(response, 401, { message: 'Unauthorized internal collaboration request' })
+    return
+  }
+  try {
+    const payload = await readJson(request)
+    if (url.pathname === '/internal/agent-document/snapshot') {
+      const documentId = normalizeDocumentId(payload.documentId)
+      if (!documentId) throw new Error('documentId 不能为空')
+      const snapshot = await withAgentDocument(documentId, async (document) => {
+        const { contentJson, plainText } = ydocToSnapshots(document)
+        return {
+          documentId,
+          contentJson,
+          plainText,
+          contentHash: contentHash(contentJson),
+          stateVector: Buffer.from(Y.encodeStateVector(document)).toString('base64'),
+          blocks: buildAgentBlocks(contentJson),
+        }
+      })
+      writeJson(response, 200, snapshot)
+      return
+    }
+    if (url.pathname === '/internal/agent-document/preview') {
+      const preview = simulateAgentPatch(payload.contentJson, payload.operations)
+      writeJson(response, 200, {
+        changes: publicPatchChanges(preview.changes),
+        changeSummary: patchSummary(preview.changes),
+        previewContentHash: contentHash(preview.contentJson),
+      })
+      return
+    }
+    if (url.pathname === '/internal/agent-document/apply') {
+      const documentId = normalizeDocumentId(payload.documentId)
+      if (!documentId) throw new Error('documentId 不能为空')
+      const result = await withAgentDocument(documentId, async (document, connection) => {
+        const current = ydocToSnapshots(document).contentJson
+        const liveContentHash = contentHash(current)
+        const preview = simulateAgentPatch(current, payload.operations)
+        await connection.transact((liveDocument) => {
+          applyAgentPatchToYDoc(liveDocument, preview.changes, TIPTAP_FIELD_NAME)
+        })
+        return {
+          documentId,
+          applied: true,
+          liveChangedSinceBase: Boolean(payload.baseContentHash && payload.baseContentHash !== liveContentHash),
+          changes: publicPatchChanges(preview.changes),
+          resultSummary: `已应用文档草案：${patchSummary(preview.changes)}`,
+        }
+      })
+      writeJson(response, 200, result)
+      return
+    }
+    writeJson(response, 404, { message: 'Not found' })
+  } catch (error) {
+    const statusCode = error instanceof AgentPatchConflictError ? 409 : 400
+    warnStep('agent-document.request.failed', {
+      path: request.url,
+      message: error instanceof Error ? error.message : String(error),
+    })
+    writeJson(response, statusCode, {
+      code: error instanceof AgentPatchConflictError ? 'CONFLICT' : 'INVALID_PATCH',
+      message: error instanceof Error ? error.message : '协作文档草案处理失败',
+    })
+  }
+}
+
+const agentInternalApiServer = createHttpServer((request, response) => {
+  void handleAgentDocumentRequest(request, response)
+})
 
 /**
  * 协同服务只负责在 MongoDB 成功落盘后通知业务后端；通知失败不能影响
@@ -499,6 +623,10 @@ async function bootstrap() {
   logStep('bootstrap.hocuspocus.ready', {
     http: `http://0.0.0.0:${PORT}`,
     websocket: `ws://127.0.0.1:${PORT}`,
+  })
+  await new Promise((resolve) => agentInternalApiServer.listen(AGENT_INTERNAL_API_PORT, resolve))
+  logStep('bootstrap.agentInternalApi.ready', {
+    http: `http://127.0.0.1:${AGENT_INTERNAL_API_PORT}`,
   })
 }
 
